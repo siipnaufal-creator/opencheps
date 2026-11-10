@@ -11,13 +11,9 @@ public final class PieceClassifier {
     private static final String TAG = "OC/Classifier";
     private static final char UNKNOWN = '?';
 
-    // RMS distance: rentang teoritis 0 sampai 1.
     private static final float MAX_TEMPLATE_DISTANCE = 0.22f;
     private static final float MIN_CLASS_MARGIN = 0.015f;
     private static final float MIN_COLOR_CONFIDENCE = 0.025f;
-
-    // frameChangeThreshold menggunakan SUM squared distance,
-    // bukan RMS. Jangan samakan kedua satuan ini.
     private static final float MIN_FRAME_CHANGE_THRESHOLD = 0.30f;
 
     private static final char[] START_WHITE_POV = {
@@ -42,10 +38,7 @@ public final class PieceClassifier {
     private char[] previousLabels;
     private char[] labels;
 
-    private float emptyEdgeMax;
-    private float occupiedEdgeMin;
     private float pieceColorThreshold;
-
     private float frameChangeThreshold =
             MIN_FRAME_CHANGE_THRESHOLD;
 
@@ -81,83 +74,71 @@ public final class PieceClassifier {
 
         for (int row = 2; row <= 5; row++) {
             for (int file = 0; file < 8; file++) {
-                float edge = samples[row * 8 + file].edgeEnergy;
-                maxEmptyEdge = Math.max(maxEmptyEdge, edge);
+                maxEmptyEdge = Math.max(
+                        maxEmptyEdge,
+                        samples[row * 8 + file].edgeEnergy
+                );
             }
         }
 
         float minOccupiedEdge = Float.MAX_VALUE;
 
         for (int row = 0; row < 8; row++) {
-            if (row >= 2 && row <= 5) {
-                continue;
-            }
+            if (row >= 2 && row <= 5) continue;
 
             for (int file = 0; file < 8; file++) {
-                float edge = samples[row * 8 + file].edgeEnergy;
-                minOccupiedEdge = Math.min(minOccupiedEdge, edge);
+                minOccupiedEdge = Math.min(
+                        minOccupiedEdge,
+                        samples[row * 8 + file].edgeEnergy
+                );
             }
         }
 
         if (minOccupiedEdge == Float.MAX_VALUE
                 || minOccupiedEdge < maxEmptyEdge * 1.5f) {
-
-            Log.w(TAG, "Bootstrap rejected: weak empty/occupied separation");
+            Log.w(TAG, "Bootstrap rejected: weak edge separation");
             return false;
         }
 
-        float topLumSum = 0f;
-        float bottomLumSum = 0f;
-
-        int topCount = 0;
-        int bottomCount = 0;
+        float topSum = 0f;
+        float bottomSum = 0f;
 
         for (int file = 0; file < 8; file++) {
             for (int row = 0; row <= 1; row++) {
-                topLumSum += samples[row * 8 + file].meanLum;
-                topCount++;
+                topSum += samples[row * 8 + file].meanLum;
             }
 
             for (int row = 6; row <= 7; row++) {
-                bottomLumSum += samples[row * 8 + file].meanLum;
-                bottomCount++;
+                bottomSum += samples[row * 8 + file].meanLum;
             }
         }
 
-        if (topCount == 0 || bottomCount == 0) {
-            return false;
-        }
-
-        float topAverage = topLumSum / topCount;
-        float bottomAverage = bottomLumSum / bottomCount;
+        float topAverage = topSum / 16f;
+        float bottomAverage = bottomSum / 16f;
 
         if (Math.abs(topAverage - bottomAverage)
                 < MIN_COLOR_CONFIDENCE) {
-
-            Log.w(TAG, "Bootstrap rejected: cannot identify board side");
+            Log.w(TAG, "Bootstrap rejected: board orientation unclear");
             return false;
         }
 
-        Side detectedSide =
-                bottomAverage > topAverage ? Side.WHITE : Side.BLACK;
+        bootstrapSide = bottomAverage > topAverage
+                ? Side.WHITE
+                : Side.BLACK;
 
-        char[] initialLabels =
-                detectedSide == Side.WHITE
-                        ? START_WHITE_POV.clone()
-                        : flipLabels(START_WHITE_POV);
+        labels = bootstrapSide == Side.WHITE
+                ? START_WHITE_POV.clone()
+                : flipLabels(START_WHITE_POV);
 
         float whiteSum = 0f;
         float blackSum = 0f;
-
         int whiteCount = 0;
         int blackCount = 0;
 
         for (int i = 0; i < 64; i++) {
-            char piece = initialLabels[i];
+            char piece = labels[i];
 
-            if (piece == '.') {
-                continue;
-            }
+            if (piece == '.') continue;
 
             float lum = samples[i].meanLum;
 
@@ -174,62 +155,42 @@ public final class PieceClassifier {
             return false;
         }
 
-        float whiteAverage = whiteSum / whiteCount;
-        float blackAverage = blackSum / blackCount;
+        whitePieceLumAvg = whiteSum / whiteCount;
+        blackPieceLumAvg = blackSum / blackCount;
 
-        if (Math.abs(whiteAverage - blackAverage)
+        if (Math.abs(whitePieceLumAvg - blackPieceLumAvg)
                 < MIN_COLOR_CONFIDENCE) {
-
-            Log.w(TAG, "Bootstrap rejected: piece colors ambiguous");
+            Log.w(TAG, "Bootstrap rejected: piece colors unclear");
             return false;
         }
 
-        templates = samples;
-        labels = initialLabels;
-        bootstrapSide = detectedSide;
-
-        emptyEdgeMax = maxEmptyEdge;
-        occupiedEdgeMin = minOccupiedEdge;
+        templates = samples.clone();
+        previousFrame = samples;
+        previousLabels = labels.clone();
 
         pieceColorThreshold =
-                (emptyEdgeMax + occupiedEdgeMin) * 0.5f;
+                (maxEmptyEdge + minOccupiedEdge) * 0.5f;
 
-        whitePieceLumAvg = whiteAverage;
-        blackPieceLumAvg = blackAverage;
-
-        previousFrame = samples;
-        previousLabels = initialLabels.clone();
-
-        // Pertahankan satuan asli SquareSampler.lumDistance().
-        // Hitung noise dari kotak kosong dengan warna kotak sama.
         float maxEmptyNoise = 0f;
 
         for (int i = 0; i < 64; i++) {
-            if (labels[i] != '.') {
-                continue;
-            }
+            if (labels[i] != '.') continue;
 
             for (int j = i + 1; j < 64; j++) {
-                if (labels[j] != '.') {
-                    continue;
-                }
+                if (labels[j] != '.') continue;
 
-                boolean sameSquareColor =
+                boolean sameColor =
                         (((i / 8) + (i % 8)) & 1)
-                        == (((j / 8) + (j % 8)) & 1);
+                                == (((j / 8) + (j % 8)) & 1);
 
-                if (!sameSquareColor) {
-                    continue;
-                }
-
-                float distance = SquareSampler.lumDistance(
-                        samples[i].feature,
-                        samples[j].feature
-                );
+                if (!sameColor) continue;
 
                 maxEmptyNoise = Math.max(
                         maxEmptyNoise,
-                        distance
+                        SquareSampler.lumDistance(
+                                samples[i].feature,
+                                samples[j].feature
+                        )
                 );
             }
         }
@@ -242,13 +203,9 @@ public final class PieceClassifier {
         trained = true;
 
         Log.i(TAG,
-                "BOOTSTRAPPED"
-                        + " side=" + bootstrapSide
-                        + " emptyMax=" + emptyEdgeMax
-                        + " occupiedMin=" + occupiedEdgeMin
+                "BOOTSTRAPPED side=" + bootstrapSide
                         + " edgeThreshold=" + pieceColorThreshold
-                        + " frameThresholdSum=" + frameChangeThreshold
-                        + " emptyNoise=" + maxEmptyNoise);
+                        + " frameThreshold=" + frameChangeThreshold);
 
         return true;
     }
@@ -264,29 +221,25 @@ public final class PieceClassifier {
 
         SquareSampler.Sample[] samples = sampleAll(bmp, board);
 
-        if (samples == null) {
-            return null;
-        }
+        if (samples == null) return null;
 
         char[][] grid = new char[8][8];
 
         for (int row = 0; row < 8; row++) {
             for (int file = 0; file < 8; file++) {
-
                 int index = row * 8 + file;
                 SquareSampler.Sample current = samples[index];
 
                 if (previousFrame != null
-                        && previousLabels != null) {
+                        && previousLabels != null
+                        && previousFrame[index] != null) {
 
-                    // Satuan sama dengan frameChangeThreshold:
-                    // SUM squared difference, bukan RMS.
-                    float frameDistance = SquareSampler.lumDistance(
+                    float distance = SquareSampler.lumDistance(
                             current.feature,
                             previousFrame[index].feature
                     );
 
-                    if (frameDistance < frameChangeThreshold) {
+                    if (distance < frameChangeThreshold) {
                         grid[row][file] = previousLabels[index];
                         continue;
                     }
@@ -316,24 +269,32 @@ public final class PieceClassifier {
 
         SquareSampler.Sample[] samples = sampleAll(bmp, board);
 
-        if (samples == null) {
-            return;
-        }
-
-        previousFrame = samples;
+        if (samples == null) return;
 
         if (previousLabels == null) {
             previousLabels = new char[64];
         }
 
+        // Simpan contoh baru hanya dari bidak yang sudah
+        // dikonfirmasi oleh sistem gerakan.
+        // Template lama pada petak kosong tetap dipertahankan.
         for (int row = 0; row < 8; row++) {
             for (int file = 0; file < 8; file++) {
+                int index = row * 8 + file;
                 char piece = grid[row][file];
 
-                previousLabels[row * 8 + file] =
-                        piece == 0 ? '.' : piece;
+                if (piece == 0) piece = '.';
+
+                previousLabels[index] = piece;
+
+                if (piece != '.' && samples[index] != null) {
+                    templates[index] = samples[index];
+                    labels[index] = piece;
+                }
             }
         }
+
+        previousFrame = samples;
     }
 
     private SquareSampler.Sample[] sampleAll(
@@ -362,28 +323,22 @@ public final class PieceClassifier {
 
         for (int row = 0; row < 8; row++) {
             for (int file = 0; file < 8; file++) {
-
-                int centerX = Math.round(
+                int cx = Math.round(
                         board.left + (file + 0.5f) * board.square
                 );
 
-                int centerY = Math.round(
+                int cy = Math.round(
                         board.top + (row + 0.5f) * board.square
                 );
 
-                if (centerX - radius < 0
-                        || centerY - radius < 0
-                        || centerX + radius >= bmp.getWidth()
-                        || centerY + radius >= bmp.getHeight()) {
+                if (cx - radius < 0 || cy - radius < 0
+                        || cx + radius >= bmp.getWidth()
+                        || cy + radius >= bmp.getHeight()) {
                     return null;
                 }
 
-                samples[row * 8 + file] = SquareSampler.sample(
-                        bmp,
-                        centerX,
-                        centerY,
-                        radius
-                );
+                samples[row * 8 + file] =
+                        SquareSampler.sample(bmp, cx, cy, radius);
             }
         }
 
@@ -395,9 +350,7 @@ public final class PieceClassifier {
             int row,
             int file
     ) {
-        if (sample == null) {
-            return UNKNOWN;
-        }
+        if (sample == null) return UNKNOWN;
 
         if (sample.edgeEnergy < pieceColorThreshold) {
             return '.';
@@ -415,6 +368,7 @@ public final class PieceClassifier {
         }
 
         boolean whitePiece = whiteDistance < blackDistance;
+        boolean targetLight = ((row + file) & 1) == 0;
 
         float[] bestDistances = new float[12];
 
@@ -422,12 +376,10 @@ public final class PieceClassifier {
             bestDistances[i] = Float.MAX_VALUE;
         }
 
-        boolean squareIsLight = ((row + file) & 1) == 0;
-
         for (int i = 0; i < templates.length; i++) {
             char templatePiece = labels[i];
 
-            if (templatePiece == '.') {
+            if (templatePiece == '.' || templates[i] == null) {
                 continue;
             }
 
@@ -438,24 +390,36 @@ public final class PieceClassifier {
             int templateRow = i / 8;
             int templateFile = i % 8;
 
-            boolean templateIsLight =
+            boolean templateLight =
                     ((templateRow + templateFile) & 1) == 0;
 
-            if (templateIsLight != squareIsLight) {
+            char type = Character.toLowerCase(templatePiece);
+
+            // Raja dan ratu dapat berpindah ke warna petak
+            // berbeda. Jangan menolak seluruh templatenya.
+            boolean royalPiece = type == 'k' || type == 'q';
+
+            if (templateLight != targetLight && !royalPiece) {
                 continue;
             }
 
             int typeIndex = pieceTypeIndex(templatePiece);
 
-            if (typeIndex < 0) {
-                continue;
-            }
+            if (typeIndex < 0) continue;
 
-            // RMS dipakai hanya untuk perbandingan template.
-            float distance = normalizedDistance(
-                    sample.feature,
-                    templates[i].feature
-            );
+            float distance;
+
+            if (templateLight == targetLight) {
+                distance = normalizedDistance(
+                        sample.feature,
+                        templates[i].feature
+                );
+            } else {
+                distance = normalizedShapeDistance(
+                        sample.feature,
+                        templates[i].feature
+                );
+            }
 
             if (distance < bestDistances[typeIndex]) {
                 bestDistances[typeIndex] = distance;
@@ -478,27 +442,13 @@ public final class PieceClassifier {
             }
         }
 
-        if (bestIndex < 0 || best == Float.MAX_VALUE) {
+        if (bestIndex < 0 || best > MAX_TEMPLATE_DISTANCE) {
             return UNKNOWN;
         }
 
-        if (best > MAX_TEMPLATE_DISTANCE) {
-            Log.d(TAG,
-                    "Unknown square " + row + "," + file
-                            + " distance=" + best);
+        if (secondBest != Float.MAX_VALUE
+                && secondBest - best < MIN_CLASS_MARGIN) {
             return UNKNOWN;
-        }
-
-        if (secondBest != Float.MAX_VALUE) {
-            float margin = secondBest - best;
-
-            if (margin < MIN_CLASS_MARGIN) {
-                Log.d(TAG,
-                        "Ambiguous square " + row + "," + file
-                                + " best=" + best
-                                + " second=" + secondBest);
-                return UNKNOWN;
-            }
         }
 
         return PIECE_TYPES[bestIndex];
@@ -506,28 +456,73 @@ public final class PieceClassifier {
 
     private int pieceTypeIndex(char piece) {
         for (int i = 0; i < PIECE_TYPES.length; i++) {
-            if (PIECE_TYPES[i] == piece) {
-                return i;
-            }
+            if (PIECE_TYPES[i] == piece) return i;
         }
-
         return -1;
     }
 
     private float normalizedDistance(float[] a, float[] b) {
-        if (a == null || b == null || a.length == 0
-                || a.length != b.length) {
+        if (a == null || b == null
+                || a.length == 0 || a.length != b.length) {
             return Float.MAX_VALUE;
         }
 
-        double sum = 0.0;
+        double sum = 0;
 
         for (int i = 0; i < a.length; i++) {
-            double difference = a[i] - b[i];
-            sum += difference * difference;
+            double d = a[i] - b[i];
+            sum += d * d;
         }
 
         return (float) Math.sqrt(sum / a.length);
+    }
+
+    // Membandingkan bentuk relatif ketika warna petak berbeda.
+    private float normalizedShapeDistance(float[] a, float[] b) {
+        if (a == null || b == null
+                || a.length == 0 || a.length != b.length) {
+            return Float.MAX_VALUE;
+        }
+
+        double meanA = 0;
+        double meanB = 0;
+
+        for (int i = 0; i < a.length; i++) {
+            meanA += a[i];
+            meanB += b[i];
+        }
+
+        meanA /= a.length;
+        meanB /= b.length;
+
+        double varianceA = 0;
+        double varianceB = 0;
+
+        for (int i = 0; i < a.length; i++) {
+            double da = a[i] - meanA;
+            double db = b[i] - meanB;
+
+            varianceA += da * da;
+            varianceB += db * db;
+        }
+
+        double stdA = Math.sqrt(varianceA / a.length);
+        double stdB = Math.sqrt(varianceB / b.length);
+
+        if (stdA < 0.001 || stdB < 0.001) {
+            return Float.MAX_VALUE;
+        }
+
+        double sum = 0;
+
+        for (int i = 0; i < a.length; i++) {
+            double na = (a[i] - meanA) / stdA;
+            double nb = (b[i] - meanB) / stdB;
+            double d = na - nb;
+            sum += d * d;
+        }
+
+        return (float) Math.sqrt(sum / a.length) * 0.10f;
     }
 
     private char[] flipLabels(char[] source) {
@@ -549,10 +544,7 @@ public final class PieceClassifier {
         previousLabels = null;
         labels = null;
 
-        emptyEdgeMax = 0f;
-        occupiedEdgeMin = 0f;
         pieceColorThreshold = 0f;
-
         whitePieceLumAvg = 0f;
         blackPieceLumAvg = 0f;
 
