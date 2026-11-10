@@ -1,3 +1,4 @@
+
 package com.opencheps.vision;
 
 import android.graphics.Bitmap;
@@ -5,215 +6,525 @@ import android.util.Log;
 
 import com.opencheps.util.Side;
 
-public class PieceClassifier {
+public final class PieceClassifier {
 
     private static final String TAG = "OC/Classifier";
 
+    private static final char UNKNOWN = '?';
+
+    // Batas kemiripan visual. Semakin kecil, semakin mirip.
+    private static final float MAX_TEMPLATE_DISTANCE = 0.22f;
+
+    // Selisih minimum antara kandidat terbaik dan kedua.
+    private static final float MIN_CLASS_MARGIN = 0.015f;
+
+    private static final float MIN_COLOR_CONFIDENCE = 0.025f;
+
     private static final char[] START_WHITE_POV = {
-        'r','n','b','q','k','b','n','r',
-        'p','p','p','p','p','p','p','p',
-        '.','.','.','.','.','.','.','.',
-        '.','.','.','.','.','.','.','.',
-        '.','.','.','.','.','.','.','.',
-        '.','.','.','.','.','.','.','.',
-        'P','P','P','P','P','P','P','P',
-        'R','N','B','Q','K','B','N','R'
+            'r','n','b','q','k','b','n','r',
+            'p','p','p','p','p','p','p','p',
+            '.','.','.','.','.','.','.','.',
+            '.','.','.','.','.','.','.','.',
+            '.','.','.','.','.','.','.','.',
+            '.','.','.','.','.','.','.','.',
+            'P','P','P','P','P','P','P','P',
+            'R','N','B','Q','K','B','N','R'
+    };
+
+    private static final char[] PIECE_TYPES = {
+            'P','N','B','R','Q','K',
+            'p','n','b','r','q','k'
     };
 
     private SquareSampler.Sample[] templates;
     private SquareSampler.Sample[] previousFrame;
+
     private char[] previousLabels;
     private char[] labels;
+
     private float emptyEdgeMax;
     private float occupiedEdgeMin;
     private float pieceColorThreshold;
-    private float frameChangeThreshold;
+
+    private float frameChangeThreshold = 0.30f;
+
     private float whitePieceLumAvg;
     private float blackPieceLumAvg;
+
     private boolean trained;
     private Side bootstrapSide;
 
-    public boolean isTrained() { return trained; }
-    public Side bootstrapSide() { return bootstrapSide; }
+    public boolean isTrained() {
+        return trained;
+    }
 
-    public synchronized boolean tryBootstrap(Bitmap bmp, BoardDetector.Board board) {
-        if (board == null) return false;
-        SquareSampler.Sample[] samples = sampleAll(bmp, board);
-        if (samples == null) return false;
+    public Side bootstrapSide() {
+        return bootstrapSide;
+    }
 
-        float maxEmptyEdge = 0;
-        int emptyCount = 0;
-        for (int r = 2; r <= 5; r++) for (int f = 0; f < 8; f++) {
-            float e = samples[r * 8 + f].edgeEnergy;
-            if (e > maxEmptyEdge) maxEmptyEdge = e;
-            emptyCount++;
-        }
-
-        float minOccupiedEdge = Float.MAX_VALUE;
-        int occCount = 0;
-        for (int r = 0; r < 8; r++) {
-            if (r >= 2 && r <= 5) continue;
-            for (int f = 0; f < 8; f++) {
-                float e = samples[r * 8 + f].edgeEnergy;
-                if (e < minOccupiedEdge) minOccupiedEdge = e;
-                occCount++;
-            }
-        }
-
-        if (minOccupiedEdge < maxEmptyEdge * 1.5f) {
-            Log.i(TAG, "bootstrap reject: minOccupied=" + minOccupiedEdge
-                    + " maxEmpty=" + maxEmptyEdge);
+    public synchronized boolean tryBootstrap(
+            Bitmap bmp,
+            BoardDetector.Board board
+    ) {
+        if (bmp == null || bmp.isRecycled() || board == null) {
             return false;
         }
 
+        SquareSampler.Sample[] samples = sampleAll(bmp, board);
+
+        if (samples == null) {
+            return false;
+        }
+
+        float maxEmptyEdge = 0f;
+
+        for (int row = 2; row <= 5; row++) {
+            for (int file = 0; file < 8; file++) {
+                float edge = samples[row * 8 + file].edgeEnergy;
+                maxEmptyEdge = Math.max(maxEmptyEdge, edge);
+            }
+        }
+
+        float minOccupiedEdge = Float.MAX_VALUE;
+
+        for (int row = 0; row < 8; row++) {
+            if (row >= 2 && row <= 5) {
+                continue;
+            }
+
+            for (int file = 0; file < 8; file++) {
+                float edge = samples[row * 8 + file].edgeEnergy;
+                minOccupiedEdge = Math.min(minOccupiedEdge, edge);
+            }
+        }
+
+        if (minOccupiedEdge == Float.MAX_VALUE
+                || minOccupiedEdge < maxEmptyEdge * 1.5f) {
+
+            Log.w(TAG,
+                    "Bootstrap rejected: empty and occupied squares "
+                            + "are not sufficiently different");
+
+            return false;
+        }
+
+        float topLumSum = 0f;
+        float bottomLumSum = 0f;
+
+        int topCount = 0;
+        int bottomCount = 0;
+
+        for (int file = 0; file < 8; file++) {
+            for (int row = 0; row <= 1; row++) {
+                topLumSum += samples[row * 8 + file].meanLum;
+                topCount++;
+            }
+
+            for (int row = 6; row <= 7; row++) {
+                bottomLumSum += samples[row * 8 + file].meanLum;
+                bottomCount++;
+            }
+        }
+
+        if (topCount == 0 || bottomCount == 0) {
+            return false;
+        }
+
+        float topAverage = topLumSum / topCount;
+        float bottomAverage = bottomLumSum / bottomCount;
+
+        if (Math.abs(topAverage - bottomAverage) < MIN_COLOR_CONFIDENCE) {
+            Log.w(TAG, "Bootstrap rejected: cannot identify board side");
+            return false;
+        }
+
+        Side detectedSide =
+                bottomAverage > topAverage ? Side.WHITE : Side.BLACK;
+
+        char[] initialLabels =
+                detectedSide == Side.WHITE
+                        ? START_WHITE_POV.clone()
+                        : flipLabels(START_WHITE_POV);
+
+        float whiteSum = 0f;
+        float blackSum = 0f;
+
+        int whiteCount = 0;
+        int blackCount = 0;
+
+        for (int i = 0; i < 64; i++) {
+            char piece = initialLabels[i];
+
+            if (piece == '.') {
+                continue;
+            }
+
+            float lum = samples[i].meanLum;
+
+            if (Character.isUpperCase(piece)) {
+                whiteSum += lum;
+                whiteCount++;
+            } else {
+                blackSum += lum;
+                blackCount++;
+            }
+        }
+
+        if (whiteCount == 0 || blackCount == 0) {
+            return false;
+        }
+
+        float whiteAverage = whiteSum / whiteCount;
+        float blackAverage = blackSum / blackCount;
+
+        if (Math.abs(whiteAverage - blackAverage)
+                < MIN_COLOR_CONFIDENCE) {
+
+            Log.w(TAG, "Bootstrap rejected: piece colors are ambiguous");
+            return false;
+        }
+
+        templates = samples;
+        labels = initialLabels;
+        bootstrapSide = detectedSide;
+
         emptyEdgeMax = maxEmptyEdge;
         occupiedEdgeMin = minOccupiedEdge;
-        pieceColorThreshold = (maxEmptyEdge + minOccupiedEdge) * 0.5f;
 
-        float topLumSum = 0, botLumSum = 0;
-        int topN = 0, botN = 0;
-        for (int f = 0; f < 8; f++) {
-            for (int r : new int[]{0, 1}) {
-                topLumSum += samples[r * 8 + f].meanLum;
-                topN++;
-            }
-            for (int r : new int[]{6, 7}) {
-                botLumSum += samples[r * 8 + f].meanLum;
-                botN++;
-            }
-        }
-        if (topN == 0 || botN == 0) return false;
-        float topAvg = topLumSum / topN;
-        float botAvg = botLumSum / botN;
-        Side side = botAvg > topAvg ? Side.WHITE : Side.BLACK;
+        pieceColorThreshold =
+                (emptyEdgeMax + occupiedEdgeMin) * 0.5f;
 
-        char[] map = side == Side.WHITE ? START_WHITE_POV : flipLabels(START_WHITE_POV);
-        templates = samples;
-        labels = map;
-        bootstrapSide = side;
-
-        float whiteSum = 0; int whiteN = 0;
-        float blackSum = 0; int blackN = 0;
-        for (int i = 0; i < 64; i++) {
-            char c = labels[i];
-            if (c == '.') continue;
-            float lum = samples[i].meanLum;
-            if (Character.isUpperCase(c)) { whiteSum += lum; whiteN++; }
-            else                          { blackSum += lum; blackN++; }
-        }
-        whitePieceLumAvg = whiteN > 0 ? whiteSum / whiteN : 0.7f;
-        blackPieceLumAvg = blackN > 0 ? blackSum / blackN : 0.3f;
+        whitePieceLumAvg = whiteAverage;
+        blackPieceLumAvg = blackAverage;
 
         previousFrame = samples;
-        previousLabels = new char[64];
-        for (int i = 0; i < 64; i++) previousLabels[i] = labels[i];
+        previousLabels = initialLabels.clone();
 
-        float maxBootstrapNoise = 0;
-        for (int i = 0; i < 64; i++) {
-            if (labels[i] != '.') continue;
-            for (int j = i + 1; j < 64; j++) {
-                if (labels[j] != '.') continue;
-                if ((((i/8)+(i%8))&1) != (((j/8)+(j%8))&1)) continue;
-                float d = SquareSampler.lumDistance(samples[i].feature, samples[j].feature);
-                if (d > maxBootstrapNoise) maxBootstrapNoise = d;
-            }
-        }
-        frameChangeThreshold = Math.max(0.3f, maxBootstrapNoise * 2.0f + 0.1f);
+        // Ambang perubahan gambar dibuat konservatif.
+        // Posisi yang berubah sedikit tetap diperiksa,
+        // bukan langsung dianggap sebagai gerakan.
+        frameChangeThreshold = 0.30f;
 
         trained = true;
-        Log.i(TAG, "BOOTSTRAPPED side=" + side
-                + " emptyMax=" + maxEmptyEdge
-                + " occMin=" + minOccupiedEdge
-                + " thr=" + pieceColorThreshold
-                + " frameChangeThr=" + frameChangeThreshold);
+
+        Log.i(TAG,
+                "BOOTSTRAPPED"
+                        + " side=" + bootstrapSide
+                        + " emptyMax=" + emptyEdgeMax
+                        + " occupiedMin=" + occupiedEdgeMin
+                        + " edgeThreshold=" + pieceColorThreshold
+                        + " whiteLum=" + whitePieceLumAvg
+                        + " blackLum=" + blackPieceLumAvg);
+
         return true;
     }
 
-    public synchronized char[][] classifyBoard(Bitmap bmp, BoardDetector.Board board) {
-        if (!trained) return null;
+    public synchronized char[][] classifyBoard(
+            Bitmap bmp,
+            BoardDetector.Board board
+    ) {
+        if (!trained || bmp == null || bmp.isRecycled()
+                || board == null) {
+            return null;
+        }
+
         SquareSampler.Sample[] samples = sampleAll(bmp, board);
-        if (samples == null) return null;
+
+        if (samples == null) {
+            return null;
+        }
 
         char[][] grid = new char[8][8];
-        for (int r = 0; r < 8; r++) {
-            for (int f = 0; f < 8; f++) {
-                int idx = r * 8 + f;
-                if (previousFrame != null && previousLabels != null) {
-                    float fd = SquareSampler.lumDistance(
-                            samples[idx].feature, previousFrame[idx].feature);
-                    if (fd < frameChangeThreshold) {
-                        grid[r][f] = previousLabels[idx];
+
+        for (int row = 0; row < 8; row++) {
+            for (int file = 0; file < 8; file++) {
+
+                int index = row * 8 + file;
+                SquareSampler.Sample current = samples[index];
+
+                if (previousFrame != null
+                        && previousLabels != null) {
+
+                    float frameDistance = normalizedDistance(
+                            current.feature,
+                            previousFrame[index].feature
+                    );
+
+                    if (frameDistance < frameChangeThreshold) {
+                        grid[row][file] = previousLabels[index];
                         continue;
                     }
                 }
-                grid[r][f] = classifyOne(samples[idx], r, f);
+
+                grid[row][file] = classifyOne(
+                        current,
+                        row,
+                        file
+                );
             }
         }
+
         return grid;
     }
 
-    public synchronized void commitConfirmed(char[][] grid, Bitmap bmp, BoardDetector.Board board) {
-        if (!trained || grid == null) return;
+    public synchronized void commitConfirmed(
+            char[][] grid,
+            Bitmap bmp,
+            BoardDetector.Board board
+    ) {
+        if (!trained || grid == null
+                || bmp == null || bmp.isRecycled()
+                || board == null) {
+            return;
+        }
+
         SquareSampler.Sample[] samples = sampleAll(bmp, board);
-        if (samples == null) return;
+
+        if (samples == null) {
+            return;
+        }
+
         previousFrame = samples;
-        if (previousLabels == null) previousLabels = new char[64];
-        for (int r = 0; r < 8; r++) {
-            for (int f = 0; f < 8; f++) {
-                previousLabels[r * 8 + f] = grid[r][f] == 0 ? '.' : grid[r][f];
+
+        if (previousLabels == null) {
+            previousLabels = new char[64];
+        }
+
+        for (int row = 0; row < 8; row++) {
+            for (int file = 0; file < 8; file++) {
+                char piece = grid[row][file];
+
+                previousLabels[row * 8 + file] =
+                        piece == 0 ? '.' : piece;
             }
         }
     }
 
-    private SquareSampler.Sample[] sampleAll(Bitmap bmp, BoardDetector.Board board) {
-        if (board.square < 8) return null;
-        int rad = Math.max(4, (int) (board.square * 0.32f));
-        SquareSampler.Sample[] samples = new SquareSampler.Sample[64];
-        for (int r = 0; r < 8; r++) {
-            for (int f = 0; f < 8; f++) {
-                int cx = Math.round(board.left + (f + 0.5f) * board.square);
-                int cy = Math.round(board.top  + (r + 0.5f) * board.square);
-                samples[r * 8 + f] = SquareSampler.sample(bmp, cx, cy, rad);
+    private SquareSampler.Sample[] sampleAll(
+            Bitmap bmp,
+            BoardDetector.Board board
+    ) {
+        if (bmp == null || bmp.isRecycled()
+                || board.square < 8
+                || board.side <= 0) {
+            return null;
+        }
+
+        if (board.left < 0 || board.top < 0
+                || board.left + board.side > bmp.getWidth()
+                || board.top + board.side > bmp.getHeight()) {
+            return null;
+        }
+
+        int radius = Math.max(
+                4,
+                (int) (board.square * 0.32f)
+        );
+
+        SquareSampler.Sample[] samples =
+                new SquareSampler.Sample[64];
+
+        for (int row = 0; row < 8; row++) {
+            for (int file = 0; file < 8; file++) {
+
+                int centerX = Math.round(
+                        board.left + (file + 0.5f) * board.square
+                );
+
+                int centerY = Math.round(
+                        board.top + (row + 0.5f) * board.square
+                );
+
+                if (centerX - radius < 0
+                        || centerY - radius < 0
+                        || centerX + radius >= bmp.getWidth()
+                        || centerY + radius >= bmp.getHeight()) {
+                    return null;
+                }
+
+                samples[row * 8 + file] = SquareSampler.sample(
+                        bmp,
+                        centerX,
+                        centerY,
+                        radius
+                );
             }
         }
+
         return samples;
     }
 
-    private char[] flipLabels(char[] src) {
-        char[] o = new char[64];
-        for (int r = 0; r < 8; r++)
-            for (int f = 0; f < 8; f++)
-                o[r * 8 + f] = src[(7 - r) * 8 + (7 - f)];
-        return o;
+    private char classifyOne(
+            SquareSampler.Sample sample,
+            int row,
+            int file
+    ) {
+        if (sample == null) {
+            return UNKNOWN;
+        }
+
+        // Kotak kosong.
+        if (sample.edgeEnergy < pieceColorThreshold) {
+            return '.';
+        }
+
+        float whiteDistance =
+                Math.abs(sample.meanLum - whitePieceLumAvg);
+
+        float blackDistance =
+                Math.abs(sample.meanLum - blackPieceLumAvg);
+
+        if (Math.abs(whiteDistance - blackDistance)
+                < MIN_COLOR_CONFIDENCE) {
+            return UNKNOWN;
+        }
+
+        boolean whitePiece = whiteDistance < blackDistance;
+
+        float[] bestDistances = new float[12];
+
+        for (int i = 0; i < bestDistances.length; i++) {
+            bestDistances[i] = Float.MAX_VALUE;
+        }
+
+        boolean squareIsLight = ((row + file) & 1) == 0;
+
+        for (int i = 0; i < templates.length; i++) {
+
+            char templatePiece = labels[i];
+
+            if (templatePiece == '.') {
+                continue;
+            }
+
+            if (Character.isUpperCase(templatePiece) != whitePiece) {
+                continue;
+            }
+
+            int templateRow = i / 8;
+            int templateFile = i % 8;
+
+            boolean templateIsLight =
+                    ((templateRow + templateFile) & 1) == 0;
+
+            if (templateIsLight != squareIsLight) {
+                continue;
+            }
+
+            int typeIndex = pieceTypeIndex(templatePiece);
+
+            if (typeIndex < 0) {
+                continue;
+            }
+
+            float distance = normalizedDistance(
+                    sample.feature,
+                    templates[i].feature
+            );
+
+            if (distance < bestDistances[typeIndex]) {
+                bestDistances[typeIndex] = distance;
+            }
+        }
+
+        int bestIndex = -1;
+        float best = Float.MAX_VALUE;
+        float secondBest = Float.MAX_VALUE;
+
+        for (int i = 0; i < bestDistances.length; i++) {
+            float distance = bestDistances[i];
+
+            if (distance < best) {
+                secondBest = best;
+                best = distance;
+                bestIndex = i;
+            } else if (distance < secondBest) {
+                secondBest = distance;
+            }
+        }
+
+        if (bestIndex < 0 || best == Float.MAX_VALUE) {
+            return UNKNOWN;
+        }
+
+        // Jangan memaksakan tebakan jika semua template terlalu jauh.
+        if (best > MAX_TEMPLATE_DISTANCE) {
+            Log.d(TAG,
+                    "Unknown square " + row + "," + file
+                            + " distance=" + best);
+            return UNKNOWN;
+        }
+
+        // Jangan memilih jika dua jenis bidak terlalu mirip.
+        if (secondBest != Float.MAX_VALUE) {
+            float margin = secondBest - best;
+
+            if (margin < MIN_CLASS_MARGIN) {
+                Log.d(TAG,
+                        "Ambiguous square " + row + "," + file
+                                + " best=" + best
+                                + " second=" + secondBest);
+                return UNKNOWN;
+            }
+        }
+
+        return PIECE_TYPES[bestIndex];
     }
 
-    private char classifyOne(SquareSampler.Sample s, int r, int f) {
-        if (s.edgeEnergy < pieceColorThreshold) return '.';
-
-        float distWhite = Math.abs(s.meanLum - whitePieceLumAvg);
-        float distBlack = Math.abs(s.meanLum - blackPieceLumAvg);
-        boolean isWhitePiece = distWhite < distBlack;
-
-        boolean light = ((r + f) & 1) == 0;
-        float best = Float.MAX_VALUE;
-        char bestC = isWhitePiece ? 'P' : 'p';
-        for (int i = 0; i < templates.length; i++) {
-            char tc = labels[i];
-            if (tc == '.') continue;
-            if (Character.isUpperCase(tc) != isWhitePiece) continue;
-            boolean tplLight = (((i / 8) + (i % 8)) & 1) == 0;
-            if (tplLight != light) continue;
-            float d = SquareSampler.lumDistance(s.feature, templates[i].feature);
-            if (d < best) { best = d; bestC = tc; }
+    private int pieceTypeIndex(char piece) {
+        for (int i = 0; i < PIECE_TYPES.length; i++) {
+            if (PIECE_TYPES[i] == piece) {
+                return i;
+            }
         }
-        return bestC;
+
+        return -1;
+    }
+
+    private float normalizedDistance(float[] a, float[] b) {
+        if (a == null || b == null || a.length == 0
+                || a.length != b.length) {
+            return Float.MAX_VALUE;
+        }
+
+        double sum = 0.0;
+
+        for (int i = 0; i < a.length; i++) {
+            double difference = a[i] - b[i];
+            sum += difference * difference;
+        }
+
+        return (float) Math.sqrt(sum / a.length);
+    }
+
+    private char[] flipLabels(char[] source) {
+        char[] output = new char[64];
+
+        for (int row = 0; row < 8; row++) {
+            for (int file = 0; file < 8; file++) {
+                output[row * 8 + file] =
+                        source[(7 - row) * 8 + (7 - file)];
+            }
+        }
+
+        return output;
     }
 
     public synchronized void reset() {
         templates = null;
-        labels = null;
         previousFrame = null;
         previousLabels = null;
+        labels = null;
+
+        emptyEdgeMax = 0f;
+        occupiedEdgeMin = 0f;
+        pieceColorThreshold = 0f;
+
+        whitePieceLumAvg = 0f;
+        blackPieceLumAvg = 0f;
+
+        frameChangeThreshold = 0.30f;
+
         trained = false;
         bootstrapSide = null;
     }
