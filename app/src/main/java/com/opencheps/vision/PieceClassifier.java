@@ -9,16 +9,16 @@ import com.opencheps.util.Side;
 public final class PieceClassifier {
 
     private static final String TAG = "OC/Classifier";
-
     private static final char UNKNOWN = '?';
 
-    // Batas kemiripan visual. Semakin kecil, semakin mirip.
+    // RMS distance: rentang teoritis 0 sampai 1.
     private static final float MAX_TEMPLATE_DISTANCE = 0.22f;
-
-    // Selisih minimum antara kandidat terbaik dan kedua.
     private static final float MIN_CLASS_MARGIN = 0.015f;
-
     private static final float MIN_COLOR_CONFIDENCE = 0.025f;
+
+    // frameChangeThreshold menggunakan SUM squared distance,
+    // bukan RMS. Jangan samakan kedua satuan ini.
+    private static final float MIN_FRAME_CHANGE_THRESHOLD = 0.30f;
 
     private static final char[] START_WHITE_POV = {
             'r','n','b','q','k','b','n','r',
@@ -46,7 +46,8 @@ public final class PieceClassifier {
     private float occupiedEdgeMin;
     private float pieceColorThreshold;
 
-    private float frameChangeThreshold = 0.30f;
+    private float frameChangeThreshold =
+            MIN_FRAME_CHANGE_THRESHOLD;
 
     private float whitePieceLumAvg;
     private float blackPieceLumAvg;
@@ -101,10 +102,7 @@ public final class PieceClassifier {
         if (minOccupiedEdge == Float.MAX_VALUE
                 || minOccupiedEdge < maxEmptyEdge * 1.5f) {
 
-            Log.w(TAG,
-                    "Bootstrap rejected: empty and occupied squares "
-                            + "are not sufficiently different");
-
+            Log.w(TAG, "Bootstrap rejected: weak empty/occupied separation");
             return false;
         }
 
@@ -133,7 +131,9 @@ public final class PieceClassifier {
         float topAverage = topLumSum / topCount;
         float bottomAverage = bottomLumSum / bottomCount;
 
-        if (Math.abs(topAverage - bottomAverage) < MIN_COLOR_CONFIDENCE) {
+        if (Math.abs(topAverage - bottomAverage)
+                < MIN_COLOR_CONFIDENCE) {
+
             Log.w(TAG, "Bootstrap rejected: cannot identify board side");
             return false;
         }
@@ -180,7 +180,7 @@ public final class PieceClassifier {
         if (Math.abs(whiteAverage - blackAverage)
                 < MIN_COLOR_CONFIDENCE) {
 
-            Log.w(TAG, "Bootstrap rejected: piece colors are ambiguous");
+            Log.w(TAG, "Bootstrap rejected: piece colors ambiguous");
             return false;
         }
 
@@ -200,10 +200,44 @@ public final class PieceClassifier {
         previousFrame = samples;
         previousLabels = initialLabels.clone();
 
-        // Ambang perubahan gambar dibuat konservatif.
-        // Posisi yang berubah sedikit tetap diperiksa,
-        // bukan langsung dianggap sebagai gerakan.
-        frameChangeThreshold = 0.30f;
+        // Pertahankan satuan asli SquareSampler.lumDistance().
+        // Hitung noise dari kotak kosong dengan warna kotak sama.
+        float maxEmptyNoise = 0f;
+
+        for (int i = 0; i < 64; i++) {
+            if (labels[i] != '.') {
+                continue;
+            }
+
+            for (int j = i + 1; j < 64; j++) {
+                if (labels[j] != '.') {
+                    continue;
+                }
+
+                boolean sameSquareColor =
+                        (((i / 8) + (i % 8)) & 1)
+                        == (((j / 8) + (j % 8)) & 1);
+
+                if (!sameSquareColor) {
+                    continue;
+                }
+
+                float distance = SquareSampler.lumDistance(
+                        samples[i].feature,
+                        samples[j].feature
+                );
+
+                maxEmptyNoise = Math.max(
+                        maxEmptyNoise,
+                        distance
+                );
+            }
+        }
+
+        frameChangeThreshold = Math.max(
+                MIN_FRAME_CHANGE_THRESHOLD,
+                maxEmptyNoise * 2f + 0.1f
+        );
 
         trained = true;
 
@@ -213,8 +247,8 @@ public final class PieceClassifier {
                         + " emptyMax=" + emptyEdgeMax
                         + " occupiedMin=" + occupiedEdgeMin
                         + " edgeThreshold=" + pieceColorThreshold
-                        + " whiteLum=" + whitePieceLumAvg
-                        + " blackLum=" + blackPieceLumAvg);
+                        + " frameThresholdSum=" + frameChangeThreshold
+                        + " emptyNoise=" + maxEmptyNoise);
 
         return true;
     }
@@ -245,7 +279,9 @@ public final class PieceClassifier {
                 if (previousFrame != null
                         && previousLabels != null) {
 
-                    float frameDistance = normalizedDistance(
+                    // Satuan sama dengan frameChangeThreshold:
+                    // SUM squared difference, bukan RMS.
+                    float frameDistance = SquareSampler.lumDistance(
                             current.feature,
                             previousFrame[index].feature
                     );
@@ -363,7 +399,6 @@ public final class PieceClassifier {
             return UNKNOWN;
         }
 
-        // Kotak kosong.
         if (sample.edgeEnergy < pieceColorThreshold) {
             return '.';
         }
@@ -390,7 +425,6 @@ public final class PieceClassifier {
         boolean squareIsLight = ((row + file) & 1) == 0;
 
         for (int i = 0; i < templates.length; i++) {
-
             char templatePiece = labels[i];
 
             if (templatePiece == '.') {
@@ -417,6 +451,7 @@ public final class PieceClassifier {
                 continue;
             }
 
+            // RMS dipakai hanya untuk perbandingan template.
             float distance = normalizedDistance(
                     sample.feature,
                     templates[i].feature
@@ -447,7 +482,6 @@ public final class PieceClassifier {
             return UNKNOWN;
         }
 
-        // Jangan memaksakan tebakan jika semua template terlalu jauh.
         if (best > MAX_TEMPLATE_DISTANCE) {
             Log.d(TAG,
                     "Unknown square " + row + "," + file
@@ -455,7 +489,6 @@ public final class PieceClassifier {
             return UNKNOWN;
         }
 
-        // Jangan memilih jika dua jenis bidak terlalu mirip.
         if (secondBest != Float.MAX_VALUE) {
             float margin = secondBest - best;
 
@@ -523,7 +556,7 @@ public final class PieceClassifier {
         whitePieceLumAvg = 0f;
         blackPieceLumAvg = 0f;
 
-        frameChangeThreshold = 0.30f;
+        frameChangeThreshold = MIN_FRAME_CHANGE_THRESHOLD;
 
         trained = false;
         bootstrapSide = null;
