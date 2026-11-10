@@ -69,16 +69,14 @@ public final class MoveAnalyzer {
 
                 changes++;
 
-                Change change = new Change(
-                        row, file, before, after
-                );
+                Change c = new Change(row, file, before, after);
 
                 if (before == '.' && after != '.') {
-                    filled.add(change);
+                    filled.add(c);
                 } else if (before != '.' && after == '.') {
-                    emptied.add(change);
+                    emptied.add(c);
                 } else {
-                    replaced.add(change);
+                    replaced.add(c);
                 }
             }
         }
@@ -91,32 +89,34 @@ public final class MoveAnalyzer {
             return unknown(changes);
         }
 
+        // Gerakan biasa
         if (emptied.size() == 1
                 && filled.size() == 1
                 && replaced.isEmpty()) {
-
             return analyzeQuiet(
+                    previous,
                     emptied.get(0),
                     filled.get(0),
                     changes
             );
         }
 
+        // Menangkap bidak
         if (emptied.size() == 1
                 && filled.isEmpty()
                 && replaced.size() == 1) {
-
             return analyzeCapture(
+                    previous,
                     emptied.get(0),
                     replaced.get(0),
                     changes
             );
         }
 
+        // En passant
         if (emptied.size() == 2
                 && filled.size() == 1
                 && replaced.isEmpty()) {
-
             return analyzeEnPassant(
                     emptied,
                     filled.get(0),
@@ -124,11 +124,12 @@ public final class MoveAnalyzer {
             );
         }
 
+        // Rokade
         if (emptied.size() == 2
                 && filled.size() == 2
                 && replaced.isEmpty()) {
-
             return analyzeCastle(
+                    previous,
                     emptied,
                     filled,
                     changes
@@ -139,6 +140,7 @@ public final class MoveAnalyzer {
     }
 
     private static Result analyzeQuiet(
+            char[][] board,
             Change from,
             Change to,
             int changes
@@ -152,16 +154,20 @@ public final class MoveAnalyzer {
 
         if (piece != arrived) {
             if (Character.toLowerCase(piece) == 'p'
-                    && isPromotionRank(to.row)
-                    && isPromotionPiece(arrived)) {
-
+                    && isPromotionPiece(arrived)
+                    && isCorrectPromotion(piece, from, to)
+                    && pathClear(board, from, to)) {
                 return result(Kind.PROMOTION, piece, changes);
             }
 
             return unknown(changes);
         }
 
-        if (!validMovementShape(piece, from, to)) {
+        if (!validMovementShape(piece, from, to, false)) {
+            return unknown(changes);
+        }
+
+        if (!pathClear(board, from, to)) {
             return unknown(changes);
         }
 
@@ -169,6 +175,7 @@ public final class MoveAnalyzer {
     }
 
     private static Result analyzeCapture(
+            char[][] board,
             Change from,
             Change destination,
             int changes
@@ -187,16 +194,20 @@ public final class MoveAnalyzer {
 
         if (attacker != arrived) {
             if (Character.toLowerCase(attacker) == 'p'
-                    && isPromotionRank(destination.row)
-                    && isPromotionPiece(arrived)) {
-
+                    && isPromotionPiece(arrived)
+                    && isCorrectPromotion(attacker, from, destination)
+                    && pathClear(board, from, destination)) {
                 return result(Kind.PROMOTION, attacker, changes);
             }
 
             return unknown(changes);
         }
 
-        if (!validMovementShape(attacker, from, destination)) {
+        if (!validMovementShape(attacker, from, destination, true)) {
+            return unknown(changes);
+        }
+
+        if (!pathClear(board, from, destination)) {
             return unknown(changes);
         }
 
@@ -208,9 +219,6 @@ public final class MoveAnalyzer {
             Change filled,
             int changes
     ) {
-        Change first = emptied.get(0);
-        Change second = emptied.get(1);
-
         Change pawnFrom = null;
         Change victimFrom = null;
 
@@ -220,17 +228,19 @@ public final class MoveAnalyzer {
             }
 
             if (sameColor(c.before, filled.after)) {
+                if (pawnFrom != null) {
+                    return unknown(changes);
+                }
                 pawnFrom = c;
             } else {
+                if (victimFrom != null) {
+                    return unknown(changes);
+                }
                 victimFrom = c;
             }
         }
 
         if (pawnFrom == null || victimFrom == null) {
-            return unknown(changes);
-        }
-
-        if (!sameColor(pawnFrom.before, filled.after)) {
             return unknown(changes);
         }
 
@@ -261,6 +271,7 @@ public final class MoveAnalyzer {
     }
 
     private static Result analyzeCastle(
+            char[][] board,
             List<Change> emptied,
             List<Change> filled,
             int changes
@@ -272,16 +283,20 @@ public final class MoveAnalyzer {
 
         for (Change c : emptied) {
             if (Character.toLowerCase(c.before) == 'k') {
+                if (kingFrom != null) return unknown(changes);
                 kingFrom = c;
             } else if (Character.toLowerCase(c.before) == 'r') {
+                if (rookFrom != null) return unknown(changes);
                 rookFrom = c;
             }
         }
 
         for (Change c : filled) {
             if (Character.toLowerCase(c.after) == 'k') {
+                if (kingTo != null) return unknown(changes);
                 kingTo = c;
             } else if (Character.toLowerCase(c.after) == 'r') {
+                if (rookTo != null) return unknown(changes);
                 rookTo = c;
             }
         }
@@ -291,40 +306,56 @@ public final class MoveAnalyzer {
             return unknown(changes);
         }
 
-        if (!sameColor(kingFrom.before, rookFrom.before)
-                || !sameColor(kingTo.after, rookTo.after)) {
+        char king = kingFrom.before;
+
+        if (!sameColor(king, rookFrom.before)
+                || !sameColor(king, kingTo.after)
+                || !sameColor(king, rookTo.after)) {
             return unknown(changes);
         }
 
-        if (!sameColor(kingFrom.before, kingTo.after)) {
+        int homeRow = isWhite(king) ? 7 : 0;
+
+        if (kingFrom.row != homeRow
+                || kingFrom.file != 4
+                || rookFrom.row != homeRow
+                || kingTo.row != homeRow
+                || rookTo.row != homeRow) {
             return unknown(changes);
         }
 
-        if (kingFrom.row != kingTo.row
-                || rookFrom.row != rookTo.row
-                || kingFrom.row != rookFrom.row) {
+        boolean kingSide = rookFrom.file == 7;
+
+        if (!kingSide && rookFrom.file != 0) {
             return unknown(changes);
         }
 
-        if (Math.abs(kingTo.file - kingFrom.file) != 2) {
+        int expectedKingFile = kingSide ? 6 : 2;
+        int expectedRookFile = kingSide ? 5 : 3;
+
+        if (kingTo.file != expectedKingFile
+                || rookTo.file != expectedRookFile) {
             return unknown(changes);
         }
 
-        if (Math.abs(rookTo.file - rookFrom.file) != 2) {
-            return unknown(changes);
+        int step = kingSide ? 1 : -1;
+
+        for (int file = 4 + step;
+             file != rookFrom.file;
+             file += step) {
+            if (board[homeRow][file] != '.') {
+                return unknown(changes);
+            }
         }
 
-        if (kingTo.file == rookTo.file) {
-            return unknown(changes);
-        }
-
-        return result(Kind.CASTLE, kingFrom.before, changes);
+        return result(Kind.CASTLE, king, changes);
     }
 
     private static boolean validMovementShape(
             char piece,
             Change from,
-            Change to
+            Change to,
+            boolean capture
     ) {
         int dr = to.row - from.row;
         int df = to.file - from.file;
@@ -336,14 +367,21 @@ public final class MoveAnalyzer {
             case 'p': {
                 int direction = isWhite(piece) ? -1 : 1;
 
-                if (df == 0 && dr == direction) {
+                if (capture) {
+                    return dr == direction && af == 1;
+                }
+
+                if (df != 0) {
+                    return false;
+                }
+
+                if (dr == direction) {
                     return true;
                 }
 
                 int startingRow = isWhite(piece) ? 6 : 1;
 
-                return df == 0
-                        && from.row == startingRow
+                return from.row == startingRow
                         && dr == direction * 2;
             }
 
@@ -370,6 +408,71 @@ public final class MoveAnalyzer {
             default:
                 return false;
         }
+    }
+
+    private static boolean pathClear(
+            char[][] board,
+            Change from,
+            Change to
+    ) {
+        char piece = from.before;
+        int dr = to.row - from.row;
+        int df = to.file - from.file;
+
+        // Kuda loncat kuda tidak perlu pemeriksaan jalur.
+        if (Character.toLowerCase(piece) == 'n') {
+            return true;
+        }
+
+        // Gerakan satu petak tidak memiliki petak perantara.
+        if (Math.max(Math.abs(dr), Math.abs(df)) <= 1) {
+            return true;
+        }
+
+        int rowStep = Integer.compare(dr, 0);
+        int fileStep = Integer.compare(df, 0);
+
+        int row = from.row + rowStep;
+        int file = from.file + fileStep;
+
+        while (row != to.row || file != to.file) {
+            if (row < 0 || row >= 8 || file < 0 || file >= 8) {
+                return false;
+            }
+
+            if (board[row][file] != '.') {
+                return false;
+            }
+
+            row += rowStep;
+            file += fileStep;
+        }
+
+        // Dua langkah pion: petak di tengah wajib kosong.
+        if (Character.toLowerCase(piece) == 'p'
+                && df == 0
+                && Math.abs(dr) == 2) {
+            int middleRow = (from.row + to.row) / 2;
+            return board[middleRow][from.file] == '.';
+        }
+
+        return true;
+    }
+
+    private static boolean isCorrectPromotion(
+            char pawn,
+            Change from,
+            Change to
+    ) {
+        int direction = isWhite(pawn) ? -1 : 1;
+        int targetRow = isWhite(pawn) ? 0 : 7;
+
+        if (to.row != targetRow
+                || to.row - from.row != direction) {
+            return false;
+        }
+
+        return Math.abs(to.file - from.file) <= 1;
     }
 
     private static boolean validGrid(char[][] grid) {
@@ -405,10 +508,6 @@ public final class MoveAnalyzer {
 
     private static boolean sameColor(char a, char b) {
         return isWhite(a) == isWhite(b);
-    }
-
-    private static boolean isPromotionRank(int row) {
-        return row == 0 || row == 7;
     }
 
     private static boolean isPromotionPiece(char piece) {
