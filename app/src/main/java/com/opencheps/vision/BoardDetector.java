@@ -4,10 +4,12 @@ package com.opencheps.vision;
 import android.graphics.Bitmap;
 import android.util.Log;
 
-public class BoardDetector {
+public final class BoardDetector {
 
     public static class Board {
-        public final int left, top, side;
+        public final int left;
+        public final int top;
+        public final int side;
         public final float square;
         public final double confidence;
 
@@ -21,345 +23,480 @@ public class BoardDetector {
     }
 
     private static final String TAG = "OC/Detector";
+
+    // Ukuran maksimum gambar untuk proses deteksi.
     private static final int WORK_MAX_EDGE = 360;
-    private static final double ACCEPT_THRESHOLD = 18.0;
+
+    // Nilai minimum kualitas kandidat papan.
+    private static final double ACCEPT_THRESHOLD = 12.0;
+
+    private BoardDetector() {}
 
     public static Board locate(Bitmap src) {
-        if (src == null) return null;
+        if (src == null || src.isRecycled()) return null;
 
-        long t0 = System.nanoTime();
+        long started = System.nanoTime();
 
-        int W0 = src.getWidth();
-        int H0 = src.getHeight();
+        int originalW = src.getWidth();
+        int originalH = src.getHeight();
 
-        float scale = (float) WORK_MAX_EDGE / Math.max(W0, H0);
+        if (originalW < 100 || originalH < 100) {
+            Log.w(TAG, "Image too small");
+            return null;
+        }
 
-        int W = Math.max(64, Math.round(W0 * scale));
-        int H = Math.max(64, Math.round(H0 * scale));
+        // Jangan memperbesar bitmap yang sudah kecil.
+        float resize = Math.min(
+                1f,
+                (float) WORK_MAX_EDGE / Math.max(originalW, originalH)
+        );
 
-        Bitmap work = (scale < 0.999f)
-                ? Bitmap.createScaledBitmap(src, W, H, true)
-                : src;
+        int width = Math.max(1, Math.round(originalW * resize));
+        int height = Math.max(1, Math.round(originalH * resize));
 
-        int[] argb = new int[W * H];
-        work.getPixels(argb, 0, W, 0, 0, W, H);
+        Bitmap work = src;
 
-        if (work != src) work.recycle();
+        if (width != originalW || height != originalH) {
+            work = Bitmap.createScaledBitmap(
+                    src, width, height, true
+            );
+        }
 
-        int[] gray = new int[W * H];
+        int[] pixels = new int[width * height];
+        work.getPixels(
+                pixels, 0, width,
+                0, 0, width, height
+        );
 
-        for (int i = 0; i < gray.length; i++) {
-            int p = argb[i];
-            int r = (p >> 16) & 0xFF;
-            int g = (p >> 8) & 0xFF;
-            int b = p & 0xFF;
+        if (work != src) {
+            work.recycle();
+        }
+
+        // Konversi grayscale.
+        int[] gray = new int[width * height];
+
+        for (int i = 0; i < pixels.length; i++) {
+            int p = pixels[i];
+
+            int r = (p >> 16) & 255;
+            int g = (p >> 8) & 255;
+            int b = p & 255;
 
             gray[i] = (r * 299 + g * 587 + b * 114) / 1000;
         }
 
-        int Wp = W + 1;
-        long[] ii = new long[Wp * (H + 1)];
+        // Integral image untuk mempercepat pengukuran area.
+        int stride = width + 1;
+        long[] integral = new long[stride * (height + 1)];
 
-        for (int y = 0; y < H; y++) {
-            long row = 0;
+        for (int y = 0; y < height; y++) {
+            long rowSum = 0;
 
-            int srcBase = y * W;
-            int dstBase = (y + 1) * Wp;
-            int prevBase = y * Wp;
+            for (int x = 0; x < width; x++) {
+                rowSum += gray[y * width + x];
 
-            for (int x = 0; x < W; x++) {
-                row += gray[srcBase + x];
-                ii[dstBase + x + 1] =
-                        ii[prevBase + x + 1] + row;
+                integral[(y + 1) * stride + x + 1] =
+                        integral[y * stride + x + 1] + rowSum;
             }
         }
 
-        int minSide = Math.max(80, Math.min(W, H) / 3);
-        int maxSide = (int) (Math.min(W, H) * 0.98);
+        int minDimension = Math.min(width, height);
+
+        int minCell = Math.max(8, minDimension / 24);
+        int maxCell = (int) (minDimension / 8f * 0.98f);
+
+        if (maxCell < minCell) {
+            Log.w(TAG, "No possible board size");
+            return null;
+        }
 
         Candidate best = null;
 
-        int sizeStep = Math.max(4, (maxSide - minSide) / 24);
+        int sizeStep = Math.max(1, (maxCell - minCell) / 24);
 
-        for (int s = minSide; s <= maxSide; s += sizeStep) {
-            int cell = s / 8;
+        // Pencarian awal.
+        for (int cell = minCell; cell <= maxCell; cell += sizeStep) {
 
-            if (cell < 5) continue;
+            int side = cell * 8;
 
-            int corrected = cell * 8;
-            int posStep = Math.max(3, cell / 2);
+            if (side > width || side > height) continue;
 
-            for (int y = 0; y + corrected < H; y += posStep) {
-                for (int x = 0; x + corrected < W; x += posStep) {
+            int positionStep = Math.max(2, cell / 3);
 
-                    double score = checkerScore(
-                            ii, Wp, W, H, x, y, cell);
+            for (int y = 0; y + side <= height; y += positionStep) {
+                for (int x = 0; x + side <= width; x += positionStep) {
+
+                    double score = scoreBoard(
+                            integral, stride, width, height,
+                            x, y, cell
+                    );
 
                     if (best == null || score > best.score) {
-                        best = new Candidate(
-                                x, y, corrected, cell, score);
+                        best = new Candidate(x, y, cell, score);
                     }
                 }
             }
         }
 
-        if (best == null) return null;
-
-        Candidate refined = refine(ii, Wp, W, H, best);
-
-        long elapsed =
-                (System.nanoTime() - t0) / 1_000_000;
-
-        Log.d(TAG, "locate: " + W + "x" + H
-                + " best=" + refined.score
-                + " bbox=(" + refined.x + "," + refined.y
-                + ",s=" + refined.side + ")"
-                + " in " + elapsed + " ms");
-
-        if (refined.score < ACCEPT_THRESHOLD) return null;
-
-        int left = Math.round(refined.x / scale);
-        int top = Math.round(refined.y / scale);
-        int side = Math.round(refined.side / scale);
-
-        return new Board(left, top, side, refined.score);
-    }
-
-    private static Candidate refine(
-            long[] ii, int Wp, int W, int H, Candidate c) {
-
-        Candidate best = c;
-        int cell = c.cell;
-
-        for (int dy = -cell; dy <= cell; dy += 2) {
-            for (int dx = -cell; dx <= cell; dx += 2) {
-
-                int x = c.x + dx;
-                int y = c.y + dy;
-
-                if (x < 0 || y < 0
-                        || x + c.side >= W
-                        || y + c.side >= H) continue;
-
-                double sc = checkerScore(
-                        ii, Wp, W, H, x, y, cell);
-
-                if (sc > best.score) {
-                    best = new Candidate(
-                            x, y, c.side, cell, sc);
-                }
-            }
+        if (best == null) {
+            Log.w(TAG, "No candidate found");
+            return null;
         }
 
-        for (int ds = -cell / 4; ds <= cell / 4; ds += 2) {
+        // Penyempurnaan posisi.
+        best = refinePosition(
+                integral, stride, width, height, best
+        );
 
-            int newCell = cell + ds / 8;
+        // Penyempurnaan ukuran.
+        best = refineSize(
+                integral, stride, width, height, best
+        );
 
-            if (newCell < 5) continue;
+        // Penyempurnaan posisi terakhir.
+        best = refinePosition(
+                integral, stride, width, height, best
+        );
 
-            int newSide = newCell * 8;
-            int x = best.x;
-            int y = best.y;
+        long elapsed =
+                (System.nanoTime() - started) / 1_000_000L;
 
-            if (x + newSide >= W || y + newSide >= H) continue;
+        Log.i(TAG,
+                "Result: x=" + best.x
+                        + " y=" + best.y
+                        + " side=" + (best.cell * 8)
+                        + " cell=" + best.cell
+                        + " score=" + best.score
+                        + " time=" + elapsed + "ms"
+        );
 
-            double sc = checkerScore(
-                    ii, Wp, W, H, x, y, newCell);
+        if (best.score < ACCEPT_THRESHOLD) {
+            Log.w(TAG, "Rejected: confidence too low");
+            return null;
+        }
 
-            if (sc > best.score) {
-                best = new Candidate(
-                        x, y, newSide, newCell, sc);
+        float scaleX = width / (float) originalW;
+        float scaleY = height / (float) originalH;
+        float scaleSide = (scaleX + scaleY) * 0.5f;
+
+        int left = Math.round(best.x / scaleX);
+        int top = Math.round(best.y / scaleY);
+        int side = Math.round((best.cell * 8) / scaleSide);
+
+        // Pastikan hasil tidak keluar dari bitmap.
+        left = Math.max(0, Math.min(left, originalW - 1));
+        top = Math.max(0, Math.min(top, originalH - 1));
+
+        side = Math.max(1, Math.min(
+                side,
+                Math.min(originalW - left, originalH - top)
+        ));
+
+        return new Board(left, top, side, best.score);
+    }
+
+    private static Candidate refinePosition(
+            long[] ii,
+            int stride,
+            int width,
+            int height,
+            Candidate current
+    ) {
+        Candidate best = current;
+
+        int radius = Math.max(3, current.cell / 2);
+
+        int minX = Math.max(0, current.x - radius);
+        int maxX = Math.min(
+                width - current.cell * 8,
+                current.x + radius
+        );
+
+        int minY = Math.max(0, current.y - radius);
+        int maxY = Math.min(
+                height - current.cell * 8,
+                current.y + radius
+        );
+
+        for (int y = minY; y <= maxY; y++) {
+            for (int x = minX; x <= maxX; x++) {
+
+                double score = scoreBoard(
+                        ii, stride, width, height,
+                        x, y, current.cell
+                );
+
+                if (score > best.score) {
+                    best = new Candidate(
+                            x, y, current.cell, score
+                    );
+                }
             }
         }
 
         return best;
     }
 
-    private static double checkerScore(
-            long[] ii, int Wp, int W, int H,
-            int x0, int y0, int cell) {
+    private static Candidate refineSize(
+            long[] ii,
+            int stride,
+            int width,
+            int height,
+            Candidate current
+    ) {
+        Candidate best = current;
 
-        int samp = Math.max(2, cell / 5);
-        int inset = Math.max(2, cell / 6);
+        int radius = Math.max(2, current.cell / 8);
+
+        int minCell = Math.max(5, current.cell - radius);
+        int maxCell = current.cell + radius;
+
+        for (int cell = minCell; cell <= maxCell; cell++) {
+
+            int side = cell * 8;
+
+            if (best.x + side > width || best.y + side > height) {
+                continue;
+            }
+
+            double score = scoreBoard(
+                    ii, stride, width, height,
+                    best.x, best.y, cell
+            );
+
+            if (score > best.score) {
+                best = new Candidate(
+                        best.x, best.y, cell, score
+                );
+            }
+        }
+
+        return best;
+    }
+
+    private static double scoreBoard(
+            long[] ii,
+            int stride,
+            int width,
+            int height,
+            int x,
+            int y,
+            int cell
+    ) {
+        int side = cell * 8;
+
+        if (cell < 5 || x < 0 || y < 0
+                || x + side > width
+                || y + side > height) {
+            return -1;
+        }
 
         double[] light = new double[32];
         double[] dark = new double[32];
 
-        int li = 0;
-        int di = 0;
-
         double[] corners = new double[4];
 
-        for (int r = 0; r < 8; r++) {
-            for (int f = 0; f < 8; f++) {
+        int lightIndex = 0;
+        int darkIndex = 0;
 
-                int cx = x0 + f * cell;
-                int cy = y0 + r * cell;
+        // Sampel di empat sudut bagian dalam setiap kotak.
+        int inset = Math.max(1, Math.round(cell * 0.20f));
+        int sample = Math.max(1, Math.round(cell * 0.18f));
+
+        for (int row = 0; row < 8; row++) {
+            for (int col = 0; col < 8; col++) {
+
+                int sx = x + col * cell;
+                int sy = y + row * cell;
 
                 corners[0] = boxMean(
-                        ii, Wp, cx + inset, cy + inset, samp);
+                        ii, stride,
+                        sx + inset,
+                        sy + inset,
+                        sample
+                );
 
                 corners[1] = boxMean(
-                        ii, Wp,
-                        cx + cell - inset - samp,
-                        cy + inset, samp);
+                        ii, stride,
+                        sx + cell - inset - sample,
+                        sy + inset,
+                        sample
+                );
 
                 corners[2] = boxMean(
-                        ii, Wp,
-                        cx + inset,
-                        cy + cell - inset - samp, samp);
+                        ii, stride,
+                        sx + inset,
+                        sy + cell - inset - sample,
+                        sample
+                );
 
                 corners[3] = boxMean(
-                        ii, Wp,
-                        cx + cell - inset - samp,
-                        cy + cell - inset - samp, samp);
+                        ii, stride,
+                        sx + cell - inset - sample,
+                        sy + cell - inset - sample,
+                        sample
+                );
 
                 sort4(corners);
 
-                double median =
-                        (corners[1] + corners[2]) * 0.5;
+                // Median mengurangi pengaruh objek/bidak di sudut.
+                double value = (corners[1] + corners[2]) * 0.5;
 
-                if (((r + f) & 1) == 0) {
-                    light[li++] = median;
+                if (((row + col) & 1) == 0) {
+                    light[lightIndex++] = value;
                 } else {
-                    dark[di++] = median;
+                    dark[darkIndex++] = value;
                 }
             }
         }
 
-        double meanL = mean(light);
-        double meanD = mean(dark);
+        double meanLight = mean(light);
+        double meanDark = mean(dark);
 
-        double sigmaL = std(light, meanL);
-        double sigmaD = std(dark, meanD);
+        double deviationLight = std(light, meanLight);
+        double deviationDark = std(dark, meanDark);
 
-        double sep = Math.abs(meanL - meanD);
+        double separation = Math.abs(meanLight - meanDark);
 
-        double checker =
-                sep * sep / (4.0 + sigmaL + sigmaD);
+        // Pola kotak harus konsisten, bukan sekadar memiliki
+        // beberapa area terang dan gelap.
+        double consistencyPenalty =
+                (deviationLight + deviationDark) * 0.55;
 
         double edge = boundaryContrast(
-                ii, Wp, W, H, x0, y0, cell * 8);
+                ii, stride, width, height,
+                x, y, side
+        );
 
-        return checker + edge * 0.8;
+        return separation
+                - consistencyPenalty
+                + edge * 0.10;
     }
 
     private static double boundaryContrast(
-            long[] ii, int Wp, int W, int H,
-            int x, int y, int side) {
+            long[] ii,
+            int stride,
+            int width,
+            int height,
+            int x,
+            int y,
+            int side
+    ) {
+        int band = Math.max(2, Math.min(4, side / 100));
+        int step = Math.max(3, side / 24);
 
-        int band = 3;
-        int step = Math.max(3, side / 16);
-
-        double sum = 0;
+        double total = 0;
         int count = 0;
 
         for (int p = band; p < side - band; p += step) {
 
+            // Batas atas.
             if (y >= band) {
-                sum += Math.abs(
-                        boxMean(ii, Wp, x + p, y, band)
-                        - boxMean(ii, Wp, x + p, y - band, band));
+                total += Math.abs(
+                        boxMean(ii, stride, x + p, y, band)
+                                - boxMean(ii, stride,
+                                x + p, y - band, band)
+                );
                 count++;
             }
 
-            if (y + side + band <= H) {
-                sum += Math.abs(
-                        boxMean(ii, Wp,
+            // Batas bawah.
+            if (y + side + band <= height) {
+                total += Math.abs(
+                        boxMean(ii, stride,
                                 x + p, y + side - band, band)
-                        - boxMean(ii, Wp,
-                                x + p, y + side, band));
+                                - boxMean(ii, stride,
+                                x + p, y + side, band)
+                );
                 count++;
             }
 
+            // Batas kiri.
             if (x >= band) {
-                sum += Math.abs(
-                        boxMean(ii, Wp, x, y + p, band)
-                        - boxMean(ii, Wp, x - band, y + p, band));
+                total += Math.abs(
+                        boxMean(ii, stride, x, y + p, band)
+                                - boxMean(ii, stride,
+                                x - band, y + p, band)
+                );
                 count++;
             }
 
-            if (x + side + band <= W) {
-                sum += Math.abs(
-                        boxMean(ii, Wp,
+            // Batas kanan.
+            if (x + side + band <= width) {
+                total += Math.abs(
+                        boxMean(ii, stride,
                                 x + side - band, y + p, band)
-                        - boxMean(ii, Wp,
-                                x + side, y + p, band));
+                                - boxMean(ii, stride,
+                                x + side, y + p, band)
+                );
                 count++;
             }
         }
 
-        return count == 0 ? 0 : sum / count;
-    }
-
-    private static void sort4(double[] a) {
-        double t;
-
-        if (a[0] > a[1]) {
-            t = a[0]; a[0] = a[1]; a[1] = t;
-        }
-
-        if (a[2] > a[3]) {
-            t = a[2]; a[2] = a[3]; a[3] = t;
-        }
-
-        if (a[0] > a[2]) {
-            t = a[0]; a[0] = a[2]; a[2] = t;
-        }
-
-        if (a[1] > a[3]) {
-            t = a[1]; a[1] = a[3]; a[3] = t;
-        }
-
-        if (a[1] > a[2]) {
-            t = a[1]; a[1] = a[2]; a[2] = t;
-        }
-    }
-
-    private static double mean(double[] a) {
-        double s = 0;
-
-        for (double v : a) {
-            s += v;
-        }
-
-        return s / a.length;
-    }
-
-    private static double std(double[] a, double m) {
-        double s = 0;
-
-        for (double v : a) {
-            double d = v - m;
-            s += d * d;
-        }
-
-        return Math.sqrt(s / a.length);
+        return count == 0 ? 0 : total / count;
     }
 
     private static double boxMean(
-            long[] ii, int Wp, int x, int y, int s) {
-
-        int x2 = x + s;
-        int y2 = y + s;
+            long[] ii,
+            int stride,
+            int x,
+            int y,
+            int size
+    ) {
+        int x2 = x + size;
+        int y2 = y + size;
 
         long sum =
-                ii[y2 * Wp + x2]
-                - ii[y * Wp + x2]
-                - ii[y2 * Wp + x]
-                + ii[y * Wp + x];
+                ii[y2 * stride + x2]
+                        - ii[y * stride + x2]
+                        - ii[y2 * stride + x]
+                        + ii[y * stride + x];
 
-        return (double) sum / (s * s);
+        return sum / (double) (size * size);
+    }
+
+    private static void sort4(double[] a) {
+        for (int i = 0; i < 4; i++) {
+            for (int j = i + 1; j < 4; j++) {
+                if (a[i] > a[j]) {
+                    double temp = a[i];
+                    a[i] = a[j];
+                    a[j] = temp;
+                }
+            }
+        }
+    }
+
+    private static double mean(double[] values) {
+        double sum = 0;
+
+        for (double value : values) {
+            sum += value;
+        }
+
+        return sum / values.length;
+    }
+
+    private static double std(double[] values, double average) {
+        double sum = 0;
+
+        for (double value : values) {
+            double difference = value - average;
+            sum += difference * difference;
+        }
+
+        return Math.sqrt(sum / values.length);
     }
 
     private static final class Candidate {
-        final int x, y, side, cell;
+        final int x;
+        final int y;
+        final int cell;
         final double score;
 
-        Candidate(int x, int y, int side, int cell, double score) {
+        Candidate(int x, int y, int cell, double score) {
             this.x = x;
             this.y = y;
-            this.side = side;
             this.cell = cell;
             this.score = score;
         }
