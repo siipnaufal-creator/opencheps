@@ -109,6 +109,11 @@ public class ScreenCaptureService extends Service {
     private List<ArrowOverlayView.Arrow> currentArrows =
             new ArrayList<>();
 
+    // Simpan langkah UCI agar panah bisa dihitung ulang
+    // ketika posisi atau ukuran papan berubah.
+    private List<StockfishEngine.Pv> currentPvs =
+            new ArrayList<>();
+
     @Nullable
     @Override
     public IBinder onBind(Intent intent) {
@@ -305,6 +310,7 @@ public class ScreenCaptureService extends Service {
         observedStm = Side.WHITE;
 
         currentArrows.clear();
+        currentPvs.clear();
     }
 
     private final Runnable sampleLoop = new Runnable() {
@@ -650,6 +656,7 @@ public class ScreenCaptureService extends Service {
                 OverlayService.clearArrowsOnly();
 
                 currentArrows.clear();
+                currentPvs.clear();
                 lastDisplayedArrowFen = "";
 
                 panelStatus(
@@ -756,8 +763,11 @@ public class ScreenCaptureService extends Service {
                 return;
             }
 
+            // Simpan UCI, bukan hanya koordinat layar.
+            currentPvs = new ArrayList<>(pvs);
+
             currentArrows = buildArrows(
-                    pvs,
+                    currentPvs,
                     board
             );
 
@@ -792,20 +802,19 @@ public class ScreenCaptureService extends Service {
         }
     }
 
+    // Hitung ulang panah dari UCI dengan ukuran dan posisi
+    // papan terbaru.
     private void repushCurrentArrows(
             BoardDetector.Board board
     ) {
-
-        if (currentArrows == null
-                || currentArrows.isEmpty()) {
+        if (currentPvs == null || currentPvs.isEmpty()) {
             return;
         }
 
-        List<ArrowOverlayView.Arrow> rebuilt =
-                rebuildArrowsForNewBounds(board);
+        currentArrows = rebuildArrowsForNewBounds(board);
 
         OverlayService.pushArrows(
-                rebuilt,
+                currentArrows,
                 boardBoundsOnScreen(board)
         );
     }
@@ -813,7 +822,11 @@ public class ScreenCaptureService extends Service {
     private List<ArrowOverlayView.Arrow> rebuildArrowsForNewBounds(
             BoardDetector.Board board
     ) {
-        return currentArrows;
+        if (currentPvs == null || currentPvs.isEmpty()) {
+            return new ArrayList<>();
+        }
+
+        return buildArrows(currentPvs, board);
     }
 
     private List<ArrowOverlayView.Arrow> buildArrows(
